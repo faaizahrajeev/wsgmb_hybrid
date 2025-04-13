@@ -1,4 +1,6 @@
 # coding: utf-8
+# conda env create -n clean_microbe_env -f working_env.yml
+
 import os
 os.environ["DGL_SKIP_GRAPHBOLT"] = "1"
 os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
