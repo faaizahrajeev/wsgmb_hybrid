@@ -20,6 +20,50 @@ from torch.utils.data import DataLoader
 
 print("Imports Complete")
 
+
+import pennylane as qml
+from pennylane import numpy as np
+
+class QuantumLayer(nn.Module):
+    def __init__(self, n_qubits=4, n_features=8, n_layers=2):
+        super().__init__()
+        self.n_qubits = n_qubits
+        self.n_features = n_features
+        self.n_layers = n_layers
+
+        self.pre_net = nn.Sequential(
+            nn.Linear(32*13, 64),
+            nn.ReLU(),
+            nn.Linear(64, n_features)
+        )
+        
+        dev = qml.device("default.qubit", wires=n_qubits)
+        
+        @qml.qnode(dev, interface="torch")
+        def circuit(inputs, weights):
+            qml.AngleEmbedding(inputs, wires=range(n_qubits), rotation='Y')
+            qml.BasicEntanglerLayers(weights, wires=range(n_qubits))
+            return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
+        
+        weight_shapes = {"weights": (n_layers, n_qubits)}
+        self.q_layer = qml.qnn.TorchLayer(circuit, weight_shapes)
+        self.post_net = nn.Linear(n_qubits, 2)
+
+    def forward(self, x):
+        x = self.pre_net(x)
+        x = torch.tanh(x)
+        q_out = self.q_layer(x)  # Auto-batching
+        return self.post_net(q_out)
+
+
+    def forward(self, x):
+        x = self.pre_net(x)
+        x = torch.tanh(x)
+
+        q_out = self.q_layer(x)  # PennyLane handles batching automatically
+        return self.post_net(q_out)
+
+
 def get_dataset():
     microbio_data_h = pd.read_csv('Graph_ctrl_crc1.csv')
     microbio_data_d = pd.read_csv('Graph_case_crc1.csv')
@@ -253,117 +297,116 @@ class WSGCN(nn.Module):
         super(WSGCN, self).__init__()
         self.conv1 = WSGConv(in_dim, hid_dim, activation=torch.relu)
         self.conv2 = WSGConv(hid_dim, hid_dim, activation=torch.relu)
-        
+
         self.jk = JumpingKnowledge()
         self.pool = GSAPool(64, ratio=1.0, alpha=0.5)
         self.conv1D_1 = nn.Conv1d(1, 16, kernel_size=64, stride=64)
         self.maxpool = nn.MaxPool1d(2)
         self.conv1D_2 = nn.Conv1d(16, 32, kernel_size=3, stride=3)
-        
-        self.fc = nn.Linear(32*13, 128)
-        self.classify = nn.Linear(128, n_classes)
-        
+
+        self.quantum_classifier = QuantumLayer(n_qubits=4, n_features=4, n_layers=1)
+
     def forward(self, graph):
         h = graph.in_degrees().view(-1, 1).float()
-        h1 = self.conv1(graph, h)
-        h1 = h1.flatten(1)
-        h2 = self.conv2(graph, h1)
-        h2 = h2.flatten(1)
-        
+        h1 = self.conv1(graph, h).flatten(1)
+        h2 = self.conv2(graph, h1).flatten(1)
+
         h = self.jk([h1, h2])
         _, h, _ = self.pool(graph, h)
-        h = h.view(-1, 1, 64*81)
-        
+        h = h.view(-1, 1, 64 * 81)
+
         h = self.conv1D_1(h)
         h = self.maxpool(h)
         h = self.conv1D_2(h)
-        
         h = h.flatten(1)
-        h = F.relu(self.fc(h))
-        h = F.dropout(h, p=0.5)
-        h = self.classify(h)
-        
-        with graph.local_scope():
-            return F.log_softmax(h, dim=-1)
 
+        h = F.dropout(h, p=0.5)
+        h = self.quantum_classifier(h)
+
+        return F.log_softmax(h, dim=-1)
 
 
 def train(model, optimizer, trainloader, device):
-    model.to(device)
     model.train()
     total_loss = 0.0
-    train_correct = 0.0
-    num_batches = len(trainloader)
-    train_pred, train_label = [], []
-    num_graphs = 0
     
+    # Initialize metrics
     train_acc = tc.BinaryAccuracy()
     train_recall = tc.BinaryRecall()
     train_precision = tc.BinaryPrecision()
     train_auc = tc.BinaryAUROC(thresholds=None)
     train_specificity = tc.BinarySpecificity()
-    
-    for iter, (batch_graphs, batch_labels) in enumerate(trainloader):
-        num_graphs += batch_labels.size(0)
+
+    for batch_graphs, batch_labels in trainloader:
         optimizer.zero_grad()
         batch_graphs = batch_graphs.to(device)
-        batch_labels = batch_labels.long().to(device)
+        batch_labels = batch_labels.to(device)
         out = model(batch_graphs)
+        
+        # Update metrics
         pred = out.argmax(dim=1)
+        train_acc.update(pred.cpu(), batch_labels.cpu())
+        train_recall.update(pred.cpu(), batch_labels.cpu())
+        train_precision.update(pred.cpu(), batch_labels.cpu())
+        train_auc.update(out[:,1].cpu(), batch_labels.cpu())  # Probability scores
+        train_specificity.update(pred.cpu(), batch_labels.cpu())
+        
         loss = F.nll_loss(out, batch_labels)
         loss.backward()
         optimizer.step()
-
-        train_pred += pred.detach().cpu().numpy().tolist()
-        train_label += batch_labels.cpu().numpy().tolist()
         total_loss += loss.item()
-    
-    train_pred = torch.tensor(train_pred)
-    train_label = torch.tensor(train_label)
-    
-    acc = train_acc(train_pred, train_label)
-    auc = train_auc(train_pred, train_label)
-    recall = train_recall(train_pred, train_label)
-    precision = train_precision(train_pred, train_label)
-    specificity = train_specificity(train_pred, train_label)
-        
-    return acc, auc, recall, precision, specificity, total_loss / num_batches
+
+    return (
+        train_acc.compute(),
+        train_auc.compute(),
+        train_recall.compute(),
+        train_precision.compute(),
+        train_specificity.compute(),
+        total_loss / len(trainloader)
+    )
+
+
         
 
 @torch.no_grad()
 def test(model, testloader, device):
     model.to(device)
     model.eval()
-    loss = 0.0
-    num_graphs = 0
-    test_pred, test_label = [], []
+    total_loss = 0.0
     
+    # Initialize metrics properly
     test_acc = tc.BinaryAccuracy()
     test_recall = tc.BinaryRecall()
     test_precision = tc.BinaryPrecision()
     test_auc = tc.BinaryAUROC(thresholds=None)
     test_specificity = tc.BinarySpecificity()
-    
-    for iter, (batch_graphs, batch_labels) in enumerate(testloader):
-        num_graphs += batch_labels.size(0)
+
+    for batch_graphs, batch_labels in testloader:
         batch_graphs = batch_graphs.to(device)
-        batch_labels = batch_labels.long().to(device)
+        batch_labels = batch_labels.to(device)
         out = model(batch_graphs)
-        pred = out.argmax(dim=1)
-        test_pred += pred.detach().cpu().numpy().tolist()
-        test_label += batch_labels.cpu().numpy().tolist()
-        loss += F.nll_loss(out, batch_labels, reduction="sum").item()
         
-    test_pred = torch.tensor(test_pred)
-    test_label = torch.tensor(test_label)
-    
-    acc = test_acc(test_pred, test_label)
-    auc = test_auc(test_pred, test_label)
-    recall = test_recall(test_pred, test_label)
-    specificity = test_specificity(test_pred, test_label)
-    precision = test_precision(test_pred, test_label)
-    
-    return acc, auc, recall, precision, specificity, loss / num_graphs
+        # Update metrics
+        pred = out.argmax(dim=1)
+        test_acc.update(pred.cpu(), batch_labels.cpu())
+        test_recall.update(pred.cpu(), batch_labels.cpu())
+        test_precision.update(pred.cpu(), batch_labels.cpu())
+        test_auc.update(out[:,1].cpu(), batch_labels.cpu())  # Use probability scores for AUROC
+        test_specificity.update(pred.cpu(), batch_labels.cpu())
+        
+        total_loss += F.nll_loss(out, batch_labels, reduction="sum").item()
+
+    # Compute final metrics
+    return (
+        test_acc.compute(),
+        test_auc.compute(),
+        test_recall.compute(),
+        test_precision.compute(),
+        test_specificity.compute(),
+        total_loss / len(testloader.dataset)
+    )
+
+
 
 
 # Step 1: Prepare graph data and retrieve train/test index ============================= #       
@@ -375,10 +418,13 @@ test_set = test_set_h + test_set_d
 
 train_loader = DataLoader(train_set, batch_size = 128, shuffle = True, collate_fn = collate)
 test_loader = DataLoader(test_set, batch_size = 64, shuffle = True, collate_fn = collate)
-device = torch.device("cuda:0")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+if device.type == 'cuda':
+    torch.backends.cudnn.benchmark = True  # Add this line
 
-# Step 2: Create model =================================================================== #
+# Step 2: Create model
 model = WSGCN(1, 32, 2)
+model = model.to(device)
 
 # Step 3: Create training components ===================================================== #
 optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0001)
@@ -391,6 +437,7 @@ best_test_acc = 0.0
 best_epoch = 0
 epochs = 150
 for epoch in range(epochs):
+    print("hi")
     train_acc, train_auc, train_recall, train_precision, train_specificity, train_loss = train(model, optimizer, train_loader, device)
     test_acc, test_auc, test_recall, test_precision, test_specificity, test_loss = test(model, test_loader, device)
     
@@ -403,7 +450,7 @@ for epoch in range(epochs):
 Test acc={:.4f}, Test auc={:.4f}, Test recall={:.4f}, Test specifity={:.4f}")
         print(log_format.format(epoch + 1, train_loss, train_acc, test_loss, test_acc,
                                 test_auc, test_recall, test_specificity))
-
+    print("bye")
 print("Best Epoch: {}, Best test acc: {:.4f}".format(best_epoch, best_test_acc))
 train_stop = datetime.datetime.now()
 print("Training Time: ", train_stop - train_start)
